@@ -77,9 +77,6 @@ class InterfaceWriter:
                 if block["type"] == "DRAM":
                     self.add_dram_xml(root, block)
 
-        if self.platform.iobank_info:
-            self.add_iobank_info_xml(root, self.platform.iobank_info)
-
         xml_string = et.tostring(root, "utf-8")
         reparsed = expatbuilder.parseString(xml_string, False)
         print_string = reparsed.toprettyxml(indent="    ")
@@ -118,6 +115,13 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
 
 """
         return header.format(self.efinity_path, "True", build_name, partnumber)
+
+    def iobank_info(self, iobank_info):
+        cmd = "# ---------- IOBANK INFO ---------\n"
+        for name, iostd in iobank_info:
+            cmd += 'design.set_iobank_voltage("{0}", "{1}")\n'.format(name, iostd[:3])
+        cmd += "# ---------- END IOBANK INFO ---------\n\n"
+        return cmd
 
     def get_block(self, name):
         for b in self.blocks:
@@ -165,37 +169,8 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
                 for i, pad in enumerate(block["location"]):
                     cmd += f'design.assign_pkg_pin("{name}[{i}]","{pad}")\n'
 
-            if "out_reg" in block:
-                cmd += f'design.set_property("{name}","OUT_REG","{block["out_reg"]}")\n'
-                cmd += f'design.set_property("{name}","OUT_CLK_PIN","{block["out_clk_pin"]}")\n'
-                if "out_delay" in block:
-                    cmd += f'design.set_property("{name}","OUTDELAY","{block["out_delay"]}")\n'
-
-            if "out_clk_inv" in block:
-                cmd += f'design.set_property("{name}","IS_OUTCLK_INVERTED","{block["out_clk_inv"]}")\n'
-
-            if "in_reg" in block:
-                cmd += f'design.set_property("{name}","IN_REG","{block["in_reg"]}")\n'
-                cmd += f'design.set_property("{name}","IN_CLK_PIN","{block["in_clk_pin"]}")\n'
-                if "in_delay" in block:
-                    cmd += f'design.set_property("{name}","INDELAY","{block["in_delay"]}")\n'
-
-            if "in_clk_inv" in block:
-                cmd += f'design.set_property("{name}","IS_INCLK_INVERTED","{block["in_clk_inv"]}")\n'
-
             if "oe_reg" in block:
                 cmd += f'design.set_property("{name}","OE_REG","{block["oe_reg"]}")\n'
-
-            if "drive_strength" in block:
-                cmd += 'design.set_property("{}","DRIVE_STRENGTH","{}")\n'.format(name, block["drive_strength"])
-            if "slewrate" in block:
-                cmd += 'design.set_property("{}","SLEWRATE","{}")\n'.format(name, block["slewrate"])
-
-            if prop:
-                for p, val in prop:
-                    cmd += 'design.set_property("{}","{}","{}")\n'.format(name, p, val)
-            cmd += "\n"
-            return cmd
 
         if mode == "INPUT":
             if len(block["location"]) == 1:
@@ -205,6 +180,8 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
                 cmd += f'design.create_input_gpio("{name}",{block["size"]-1},0)\n'
                 for i, pad in enumerate(block["location"]):
                     cmd += f'design.assign_pkg_pin("{name}[{i}]","{pad}")\n'
+        
+        if mode == "INPUT" or mode == "INOUT":
             if "in_reg" in block:
                 in_clk_pin = block["in_clk_pin"]
                 if isinstance(in_clk_pin, ClockSignal):
@@ -221,21 +198,17 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
                     cmd += f'design.set_property("{name}","INDELAY","{block["in_delay"]}")\n'
             if "in_clk_inv" in block:
                 cmd += f'design.set_property("{name}","IS_INCLK_INVERTED","{block["in_clk_inv"]}")\n'
-            if prop:
-                for p, val in prop:
-                    cmd += 'design.set_property("{}","{}","{}")\n'.format(name, p, val)
-            cmd += "\n"
-            return cmd
 
         if mode == "OUTPUT":
             if len(block["location"]) == 1:
                 cmd += 'design.create_output_gpio("{}")\n'.format(name)
                 cmd += 'design.assign_pkg_pin("{}","{}")\n'.format(name, block["location"][0])
             else:
-                cmd += 'design.create_input_gpio("{}",{},0)\n'.format(name, block["size"]-1)
+                cmd += 'design.create_output_gpio("{}",{},0)\n'.format(name, block["size"]-1)
                 for i, pad in enumerate(block["location"]):
                     cmd += 'design.assign_pkg_pin("{}[{}]","{}")\n'.format(name, i, pad)
 
+        if mode == "OUTPUT" or mode == "INOUT":
             if "out_reg" in block:
                 cmd += 'design.set_property("{}","OUT_REG","{}")\n'.format(name, block["out_reg"])
                 cmd += 'design.set_property("{}","OUT_CLK_PIN","{}")\n'.format(name, block["out_clk_pin"])
@@ -249,7 +222,14 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
                 cmd += 'design.set_property("{}","DRIVE_STRENGTH","{}")\n'.format(name, block["drive_strength"])
             if "slewrate" in block:
                 cmd += 'design.set_property("{}","SLEWRATE","{}")\n'.format(name, block["slewrate"])
+            if "const_output" in block:
+                if not isinstance(block["const_output"], list):
+                    cmd += f'design.set_property("{name}","CONST_OUTPUT","{block["const_output"]}")\n'
+                else:
+                    for i, val in enumerate(block["const_output"]):
+                        cmd += f'design.set_property("{name}[{i}]","CONST_OUTPUT","{val}")\n'
 
+        if mode == "INOUT" or mode == "INPUT" or mode == "OUTPUT":
             if prop:
                 for p, val in prop:
                     cmd += 'design.set_property("{}","{}","{}")\n'.format(name, p, val)
@@ -339,13 +319,13 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
             else:
                 cmd += 'design.set_property("{}","CLKOUT{}_PHASE_SETTING","{}","PLL")\n'.format(name, i, clock[2] // 45)
 
-        # Titanium has always a feedback (local: CLK0, CORE: any output)
+        # Titanium/Topaz has always a feedback (local: CLK0, CORE: any output)
         if block["version"] == "V3":
             feedback_clk = block["feedback"]
             cmd += 'design.set_property("{}", "FEEDBACK_MODE", "{}", "PLL")\n'.format(name, "LOCAL" if feedback_clk < 1 else "CORE")
             cmd += 'design.set_property("{}", "FEEDBACK_CLK", "CLK{}", "PLL")\n'.format(name, 0 if feedback_clk < 1 else feedback_clk)
 
-        # auto_calc_pll_clock is always working with Titanium and only working when feedback is unused for Trion
+        # auto_calc_pll_clock is always working with Titanium/Topaz and only working when feedback is unused for Trion
         if block["feedback"] == -1 or block["version"] == "V3":
             cmd += "target_freq = {\n"
             for i, clock in enumerate(block["clk_out"]):
@@ -458,7 +438,7 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
                 rst_pin = rst_pin.name
 
             cmd.append('design.create_block("{}", block_type="{}", tx_mode="{}")'.format(name, block_type, tx_mode))
-            if self.platform.family == "Titanium":
+            if self.platform.family in ["Titanium", "Topaz"]:
                 cmd.append('design.set_property("{}", "TX_DELAY",     "{}",         "{}")'.format(name, delay, block_type))
                 cmd.append('design.set_property("{}", "TX_DIFF_TYPE", "LVDS",       "{}")'.format(name, block_type))
                 cmd.append('design.set_property("{}", "TX_HALF_RATE", "{}",         "{}")'.format(name, half_rate, block_type))
@@ -504,7 +484,7 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
                     delay_inc = delay_inc.name
 
             cmd.append('design.create_block("{}", block_type="{}", rx_conn_type="{}")'.format(name, block_type, rx_mode))
-            if self.platform.family == "Titanium":
+            if self.platform.family in ["Titanium", "Topaz"]:
                 cmd.append('design.set_property("{}", "GBUF",           "",   "{}")'.format(name, block_type))
                 cmd.append('design.set_property("{}", "RX_DBG_PIN",     "",   "{}")'.format(name, block_type))
                 cmd.append('design.set_property("{}", "RX_TERM_PIN",    "{}", "{}")'.format(name, term, block_type))
@@ -649,6 +629,32 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
         cmds.append(f"# ---------- END REMOTE UPDATE ---------\n")
         return "\n".join(cmds)
 
+    def generate_seu(self, block, verbose=True):
+        name = block["name"]
+        pins = block["pins"]
+        enable = block["enable"]
+        mode = block["mode"].upper()
+
+        def get_pin_name(pin):
+            return pin.backtrace[-1][0]
+
+        cmds = []
+        cmds.append(f"# ---------- SINGLE-EVENT UPSET ---------")
+        cmds.append(f'design.set_device_property("seu", "ENA_DETECT", "{enable}", "SEU")')
+        if enable:
+            cmds.append(f'design.set_device_property("seu", "CONFIG_PIN", "{get_pin_name(pins.CONFIG)}", "SEU")')
+            cmds.append(f'design.set_device_property("seu", "DONE_PIN", "{get_pin_name(pins.DONE)}", "SEU")')
+            cmds.append(f'design.set_device_property("seu", "ERROR_PIN", "{get_pin_name(pins.ERROR)}", "SEU")')
+            cmds.append(f'design.set_device_property("seu", "INJECT_ERROR_PIN", "{get_pin_name(pins.INJECT_ERROR)}", "SEU")')
+            cmds.append(f'design.set_device_property("seu", "RST_PIN", "{get_pin_name(pins.RST)}", "SEU")')
+            if mode == "MANUAL":
+                cmds.append(f'design.set_device_property("seu", "START_PIN", "{get_pin_name(pins.START)}", "SEU")')
+            cmds.append(f'design.set_device_property("seu", "MODE", "{mode}", "SEU")')
+            if mode == "AUTO" and hasattr(block, "wait_interval"):
+                cmds.append(f'design.set_device_property("seu", "WAIT_INTERVAL", "{block["wait_interval"]}", "SEU")')
+        cmds.append(f"# ---------- END SINGLE-EVENT UPSET ---------\n")
+        return "\n".join(cmds)
+
     def generate(self, partnumber):
         output = ""
         for block in self.blocks:
@@ -673,6 +679,8 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
                     output += self.generate_spiflash(block)
                 if block["type"] == "REMOTE_UPDATE":
                     output += self.generate_remote_update(block)
+                if block["type"] == "SEU":
+                    output += self.generate_seu(block)
         return output
 
     def footer(self):
@@ -681,12 +689,3 @@ design.create("{2}", "{3}", "./../gateware", overwrite=True)
 design.generate(enable_bitstream=True)
 # Save the configured periphery design
 design.save()"""
-
-
-    def add_iobank_info_xml(self, root, iobank_info):
-        dev = root.find("efxpt:device_info", namespaces)
-        bank_info = dev.find("efxpt:iobank_info", namespaces)
-        for name, iostd in iobank_info:
-            for child in bank_info:
-                    if name == child.get("name"):
-                        child.set("iostd", iostd)

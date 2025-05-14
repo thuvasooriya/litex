@@ -12,6 +12,7 @@ import re
 
 from migen import *
 
+from litex.build.efinix.efinity import EfinityToolchain
 from litex.gen import *
 
 from litex import get_data_mod
@@ -57,10 +58,12 @@ class VexiiRiscv(CPU):
     with_rva         = False
     with_dma         = False
     with_axi3        = False
+    with_opensbi     = False
     jtag_tap         = False
     jtag_instruction = False
     with_cpu_clk     = False
     vexii_video      = []
+    vexii_macsg      = []
     vexii_args       = ""
 
 
@@ -141,6 +144,7 @@ class VexiiRiscv(CPU):
         cpu_group.add_argument("--l2-self-flush",         default=None,          help="VexiiRiscv L2 ways will self flush on from,to,cycles")
         cpu_group.add_argument("--with-axi3",             action="store_true",   help="mbus will be axi3 instead of axi4")
         cpu_group.add_argument("--vexii-video",           action="append",  default=[], help="Add the memory coherent video controller")
+        cpu_group.add_argument("--vexii-macsg",           action="append",  default=[], help="Add the memory coherent ethernet mac")
 
 
 
@@ -152,7 +156,7 @@ class VexiiRiscv(CPU):
         vdir = get_data_mod("cpu", "vexiiriscv").data_location
         ndir = os.path.join(vdir, "ext", "VexiiRiscv")
 
-        NaxRiscv.git_setup("VexiiRiscv", ndir, "https://github.com/SpinalHDL/VexiiRiscv.git", "dev", "e7c9f4a3", args.update_repo)
+        NaxRiscv.git_setup("VexiiRiscv", ndir, "https://github.com/SpinalHDL/VexiiRiscv.git", "dev", "3282ca22", args.update_repo)
 
         if not args.cpu_variant:
             args.cpu_variant = "standard"
@@ -163,6 +167,7 @@ class VexiiRiscv(CPU):
         VexiiRiscv.vexii_args += " --relaxed-branch"
 
         if args.cpu_variant in ["linux", "debian"]:
+            VexiiRiscv.with_opensbi = True
             VexiiRiscv.vexii_args += " --with-rva --with-supervisor"
             VexiiRiscv.vexii_args += " --fetch-l1-ways=4 --fetch-l1-mem-data-width-min=64"
             VexiiRiscv.vexii_args += " --lsu-l1-ways=4 --lsu-l1-mem-data-width-min=64"
@@ -206,6 +211,7 @@ class VexiiRiscv(CPU):
         if args.l2_self_flush:
             VexiiRiscv.l2_self_flush = args.l2_self_flush
         VexiiRiscv.vexii_video = args.vexii_video
+        VexiiRiscv.vexii_macsg = args.vexii_macsg
 
 
     def __init__(self, platform, variant):
@@ -228,6 +234,8 @@ class VexiiRiscv(CPU):
             # Clk/Rst.
             i_litex_clk   = ClockSignal("sys"),
             i_litex_reset = ResetSignal("sys") | self.reset,
+
+            o_debug=self.tracer_payload,
 
             # Patcher/Tracer.
             # o_patcher_tracer_valid   = self.tracer_valid,
@@ -340,6 +348,28 @@ class VexiiRiscv(CPU):
             self.cpu_params["o_" + name + "_colorEn"] = color_en
             self.cpu_params["o_" + name + "_color"] = color
 
+        def add_io(direction, prefix, name, width):
+            composed = prefix + "_" + name
+            sig = Signal(width, name = composed)
+            setattr(self, composed, sig)
+            self.cpu_params[direction + "_" + composed] = sig
+
+        for macsg in VexiiRiscv.vexii_macsg:
+            args = {}
+            for i, val in enumerate(macsg.split(",")):
+                name, value = val.split("=")
+                args.update({name: value})
+            name = args["name"]
+            add_io("i", name, "tx_ref_clk", 1)
+            add_io("o", name, "tx_ctl", 2)
+            add_io("o", name, "tx_d", 8)
+            add_io("o", name, "tx_clk", 2)
+
+            add_io("i", name, "rx_ctl", 2)
+            add_io("i", name, "rx_d", 8)
+            add_io("i", name, "rx_clk", 1)
+
+
 
 
 
@@ -366,6 +396,8 @@ class VexiiRiscv(CPU):
         md5_hash.update(str(VexiiRiscv.memory_regions).encode('utf-8'))
         md5_hash.update(str(VexiiRiscv.vexii_args).encode('utf-8'))
         md5_hash.update(str(VexiiRiscv.vexii_video).encode('utf-8'))
+        md5_hash.update(str(VexiiRiscv.vexii_macsg).encode('utf-8'))
+        md5_hash.update(str(VexiiRiscv.with_opensbi).encode('utf-8'))
 
         # md5_hash.update(str(VexiiRiscv.internal_bus_width).encode('utf-8'))
 
@@ -405,6 +437,8 @@ class VexiiRiscv(CPU):
             gen_args.append(f"--with-axi3")
         for arg in VexiiRiscv.vexii_video:
             gen_args.append(f"--video {arg}")
+        for arg in VexiiRiscv.vexii_macsg:
+            gen_args.append(f"--mac-sg {arg}")
 
 
         cmd = f"""cd {ndir} && sbt "runMain vexiiriscv.soc.litex.SocGen {" ".join(gen_args)}\""""
@@ -442,12 +476,13 @@ class VexiiRiscv(CPU):
         # Set Human-name.
         self.human_name = f"{self.human_name} {self.xlen}-bit"
 
-        # Set UART/Timer0 CSRs to the ones used by OpenSBI.
-        soc.csr.add("uart",   n=2)
-        soc.csr.add("timer0", n=3)
+        if VexiiRiscv.with_opensbi:
+            # Set UART/Timer0 CSRs to the ones used by OpenSBI.
+            soc.csr.add("uart",   n=2)
+            soc.csr.add("timer0", n=3)
 
-        # Add OpenSBI region.
-        soc.bus.add_region("opensbi", SoCRegion(origin=self.mem_map["main_ram"] + 0x00f0_0000, size=0x8_0000, cached=True, linker=True))
+            # Add OpenSBI region.
+            soc.bus.add_region("opensbi", SoCRegion(origin=self.mem_map["main_ram"] + 0x00f0_0000, size=0x8_0000, cached=True, linker=True))
 
         # Define ISA.
         soc.add_config("CPU_COUNT", VexiiRiscv.cpu_count)
@@ -514,7 +549,7 @@ class VexiiRiscv(CPU):
             if soc.get_build_name() == "sim":
                 self.comb += If(debug_ndmreset_rise, soc.crg.cd_sys.rst.eq(1))
             else:
-                if hasattr(soc.crg.pll, "locked"):
+                if hasattr(soc.crg.pll, "locked") and isinstance(self.platform.toolchain, EfinityToolchain):
                     self.comb += If(debug_ndmreset, soc.crg.pll.locked.eq(0))
                 elif hasattr(soc.crg, "rst"):
                     self.comb += If(debug_ndmreset_rise, soc.crg.rst.eq(1))

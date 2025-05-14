@@ -52,8 +52,8 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
     def open(self):
         if self.binded:
             return
-        self.socket = socket.create_connection((self.host, self.port), 5.0)
-        self.socket.settimeout(5.0)
+        self.socket = socket.create_connection((self.host, self.port))
+        self.socket.settimeout(2.0)
         self._receive_server_info()
         self.binded = True
 
@@ -63,6 +63,15 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
         self.socket.close()
         del self.socket
         self.binded = False
+
+    def clear_socket_buffer(self):
+        try:
+            while True:
+                data = self.socket.recv(4096)
+                if not data:
+                    break
+        except (TimeoutError, socket.error):
+            pass
 
     def read(self, addr, length=None, burst="incr"):
         length_int = 1 if length is None else length
@@ -83,9 +92,17 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
         self.send_packet(self.socket, packet)
 
         # Receive response
+        response = self.receive_packet(self.socket, addr_size)
+        if response == 0:
+            # Handle error by returning default values
+            if self.debug:
+                print("Timeout occurred during read. Returning default values.")
+            self.clear_socket_buffer()
+            return 0 if length is None else [0] * length_int
+
         packet = EtherbonePacket(
             addr_width = self.csr_bus_address_width,
-            init       = self.receive_packet(self.socket, addr_size)
+            init       = response
         )
         packet.decode()
         datas = packet.records.pop().writes.get_datas()
@@ -153,28 +170,49 @@ def dump_registers(host, csr_csv, port, filter=None, binary=False):
 
     bus.close()
 
-def read_memory(host, csr_csv, port, addr, length, binary=False):
+def read_memory(host, csr_csv, port, addr, length, binary=False, file=None, endianness="little"):
     bus = RemoteClient(host=host, csr_csv=csr_csv, port=port)
     bus.open()
 
-    for offset in range(length//4):
-        register_value = {
-            True  : f"0b{bus.read(addr + 4*offset):032b}",
-            False : f"0x{bus.read(addr + 4*offset):08x}",
-        }[binary]
-        print(f"0x{addr + 4*offset:08x} : {register_value}")
+    if file:
+        # Read from memory and write to file in binary mode
+        with open(file, 'wb') as f:
+            for offset in range(length // 4):
+                data = bus.read(addr + 4 * offset)
+                f.write(data.to_bytes(4, byteorder=endianness))
+    else:
+        # Print to console
+        for offset in range(length // 4):
+            register_value = {
+                True  : f"0b{bus.read(addr + 4 * offset):032b}",
+                False : f"0x{bus.read(addr + 4 * offset):08x}",
+            }[binary]
+            print(f"0x{addr + 4 * offset:08x} : {register_value}")
 
     bus.close()
 
-def write_memory(host, csr_csv, port, addr, data):
+def write_memory(host, csr_csv, port, addr, data, file=None, length=None, endianness="little"):
     bus = RemoteClient(host=host, csr_csv=csr_csv, port=port)
     bus.open()
 
-    bus.write(addr, data)
+    if file:
+        # Read from file and write to memory
+        with open(file, 'rb') as f:
+            if length:
+                data = f.read(length)
+            else:
+                data = f.read()
+            # Write data in 32-bit chunks
+            for i in range(0, len(data), 4):
+                word = int.from_bytes(data[i:i + 4], byteorder=endianness)
+                bus.write(addr + i, word)
+    else:
+        # Write single data value to memory
+        bus.write(addr, data)
 
     bus.close()
 
-# Gui ----------------------------------------------------------------------------------------------
+# GUI ----------------------------------------------------------------------------------------------
 
 def run_gui(host, csr_csv, port):
     import dearpygui.dearpygui as dpg
@@ -241,6 +279,74 @@ def run_gui(host, csr_csv, port):
                 xadc_data.insert(0, get_cls())
                 yield xadc_data
 
+    # Memory.
+    # -------
+
+    def convert_size(size_bytes):
+        """
+        Convert the size from bytes to a more human-readable format.
+        """
+        if size_bytes < 1024:
+            return f"{size_bytes} Bytes"
+        elif size_bytes < 1024**2:
+            return f"{size_bytes / 1024:.2f} KB"
+        elif size_bytes < 1024**3:
+            return f"{size_bytes / (1024 ** 2):.2f} MB"
+        else:
+            return f"{size_bytes / (1024 ** 3):.2f} GB"
+
+    def read_memory_chunk(base, length):
+        """Reads `length` bytes from `base` address (word-aligned)."""
+        if length <= 0:
+            return []
+
+        aligned_len = (length + 3) & ~3  # Round up to nearest multiple of 4
+        words       = bus.read(base, aligned_len // 4, burst="incr")
+        out         = []
+
+        for word in words:
+            for byte_idx in range(4):
+                byte_val = (word >> (8 * byte_idx)) & 0xff
+                out.append(byte_val)
+
+        return out[:length]
+
+    def _printable_chr(bval):
+        c = chr(bval)
+        return c if 32 <= bval <= 126 else '.'
+
+    def refresh_dump_table():
+        """Refreshes the dump table with data from the specified base address and length."""
+        try:
+            base       = int(dpg.get_value("dump_base"), 0)
+            length_str = dpg.get_value("dump_length")
+            length     = int(length_str, 0) if length_str else 0
+        except ValueError:
+            print("Invalid base address or length.")
+            return
+
+        memory_data = read_memory_chunk(base, length)
+
+        # Clear existing ROWS (slot=1) but keep the columns in slot=0
+        for row_id in dpg.get_item_children("dump_table", 1):
+            dpg.delete_item(row_id)
+
+        # Add new rows
+        BYTES_PER_LINE = 16
+        for row_start in range(0, len(memory_data), BYTES_PER_LINE):
+            row_data = memory_data[row_start:row_start + BYTES_PER_LINE]
+            with dpg.table_row(parent="dump_table"):
+                # Address column
+                dpg.add_text(f"0x{base + row_start:08X}")
+
+                # Hex data column
+                hex_values = [f"{byte:02X}" for byte in row_data]
+                dpg.add_text(" ".join(hex_values))
+
+                # ASCII column
+                ascii_values = [_printable_chr(byte) for byte in row_data]
+                dpg.add_text("".join(ascii_values))
+
     # Create Main Window.
     # -------------------
     dpg.create_context()
@@ -297,10 +403,126 @@ def run_gui(host, csr_csv, port):
                 for i in range(8): # FIXME: Get num.
                     dpg.add_checkbox(id=f"btn{i}")
 
+    # Create Memory Window.
+    # ---------------------
+    with dpg.window(label="FPGA Memory", autosize=True, pos=(550, 150)):
+        # Memory Regions.
+        dpg.add_text("Mem Regions:")
+        with dpg.table(
+            tag            = "memory_regions_table",
+            header_row     = True,
+            row_background = True,
+            scrollY        = True,   # allow scrolling within the child
+            width          = -1,
+            height         = 100,
+        ):
+            dpg.add_table_column(label="Name")
+            dpg.add_table_column(label="Base")
+            dpg.add_table_column(label="Size")
+            dpg.add_table_column(label="Type")
+
+            for region_name, region_obj in bus.mems.__dict__.items():
+                with dpg.table_row():
+                    dpg.add_text(f"{region_name}")
+                    dpg.add_text(f"0x{region_obj.base:08X}")
+                    dpg.add_text(f"{convert_size(region_obj.size)}")
+                    dpg.add_text(f"{region_obj.type}")
+
+        # Memory Read.
+        dpg.add_separator()
+        dpg.add_text("Mem Read:")
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(label="Auto-Refresh", tag="auto_refresh_mem_read", default_value=False)
+            dpg.add_text("Delay (s):")
+            dpg.add_input_float(tag="mem_read_delay", default_value=1.0, width=100)
+        with dpg.group(horizontal=True):
+            dpg.add_text("Address:")
+            dpg.add_input_text(
+                tag           = "read_addr",
+                default_value = "0x00000000",
+                width         = 120
+            )
+            dpg.add_text("Value:")
+            dpg.add_input_text(
+                tag           = "read_value",
+                default_value = "0x00000000",
+                width         = 120,
+                readonly      = True
+            )
+            dpg.add_button(
+                label    = "Read",
+                callback = lambda: dpg.set_value("read_value", f"0x{bus.read(int(dpg.get_value('read_addr'), 0)):08X}")
+            )
+
+        # Memory Write.
+        dpg.add_separator()
+        dpg.add_text("Mem Write:")
+        with dpg.group(horizontal=True):
+            dpg.add_text("Address:")
+            dpg.add_input_text(
+                tag           = "write_addr",
+                default_value = "0x00000000",
+                width         = 120
+            )
+            dpg.add_text("Value:")
+            dpg.add_input_text(
+                tag           = "write_value",
+                default_value = "0x00000000",
+                width         = 120
+            )
+            dpg.add_button(
+                label    = "Write",
+                callback = lambda: bus.write(int(dpg.get_value("write_addr"), 0), int(dpg.get_value("write_value"), 0))
+            )
+
+
+        # Memory Dump
+        dpg.add_separator()
+        dpg.add_text("Mem Dump")
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(label="Auto-Refresh", tag="auto_refresh_mem_dump", default_value=False)
+            dpg.add_text("Delay (s):")
+            dpg.add_input_float(tag="mem_dump_delay", default_value=1.0, width=100)
+        with dpg.group(horizontal=True):
+            # Base.
+            dpg.add_text("Base:")
+            dpg.add_input_text(
+                tag           = "dump_base",
+                default_value = "0x00000000",
+                width         = 120
+            )
+
+            # Length.
+            dpg.add_text("Length (bytes):")
+            dpg.add_input_text(
+                tag           = "dump_length",
+                default_value = "256",
+                width         = 120
+            )
+
+            # Control
+            dpg.add_button(label="Read", callback=refresh_dump_table)
+
+        # Memory Table
+        with dpg.table(
+            tag            = "dump_table",
+            header_row     = True,
+            resizable      = False,
+            policy         = dpg.mvTable_SizingStretchProp,
+            scrollX        = True,
+            scrollY        = True,
+            row_background = True,
+            width          = -1,
+            height         = -1,
+        ):
+            dpg.add_table_column(label="Address")
+            dpg.add_table_column(label="Hex Data")
+            dpg.add_table_column(label="ASCII")
+
     # Create XADC Window.
     # -------------------
     if with_xadc:
-        with dpg.window(label="FPGA XADC", width=600, height=600, pos=(950, 0)):
+        with dpg.window(label="FPGA XADC", width=600, height=600, pos=(1000, 0)):
             with dpg.subplots(2, 2, label="", width=-1, height=-1) as subplot_id:
                 # Temperature.
                 with dpg.plot(label=f"Temperature (°C)"):
@@ -328,6 +550,9 @@ def run_gui(host, csr_csv, port):
                     dpg.set_axis_limits("vccbram_y", 0, 1.8)
 
     def timer_callback(refresh=1e-1, xadc_points=100):
+        last_mem_read_time = time.time()
+        last_mem_dump_time = time.time()
+
         if with_xadc:
             temp    = gen_xadc_data(get_xadc_temp,    n=xadc_points)
             vccint  = gen_xadc_data(get_xadc_vccint,  n=xadc_points)
@@ -335,6 +560,8 @@ def run_gui(host, csr_csv, port):
             vccbram = gen_xadc_data(get_xadc_vccbram, n=xadc_points)
 
         while dpg.is_dearpygui_running():
+            now = time.time()
+
             # CSR Update.
             for name, reg in bus.regs.__dict__.items():
                 value = reg.read()
@@ -365,6 +592,27 @@ def run_gui(host, csr_csv, port):
                 for i in range(8): # FIXME; Get num.
                     dpg.set_value(f"btn{i}", bool(get_buttons(i)))
 
+            # Mem Read Auto-Refresh.
+            if dpg.does_item_exist("auto_refresh_mem_read"):
+                if dpg.get_value("auto_refresh_mem_read"):
+                    delay_sec = dpg.get_value("mem_read_delay")
+                    if (now - last_mem_read_time) >= delay_sec:
+                        try:
+                            read_addr = int(dpg.get_value("read_addr"), 0)
+                            val       = bus.read(read_addr)
+                            dpg.set_value("read_value", f"0x{val:08X}")
+                        except ValueError:
+                            pass
+                        last_mem_read_time = now
+
+            # Mem Dump Auto-Refresh.
+            if dpg.does_item_exist("auto_refresh_mem_dump"):
+                if dpg.get_value("auto_refresh_mem_dump"):
+                    delay_sec = dpg.get_value("mem_dump_delay")
+                    if (now - last_mem_dump_time) >= delay_sec:
+                        refresh_dump_table()
+                        last_mem_dump_time = now
+
             time.sleep(refresh)
 
     timer_thread = threading.Thread(target=timer_callback)
@@ -383,23 +631,37 @@ def run_gui(host, csr_csv, port):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX Client utility.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--csr-csv", default="csr.csv",     help="CSR configuration file")
-    parser.add_argument("--host",    default="localhost",   help="Host ip address")
-    parser.add_argument("--port",    default="1234",        help="Host bind port.")
-    parser.add_argument("--ident",   action="store_true",   help="Dump SoC identifier.")
-    parser.add_argument("--regs",    action="store_true",   help="Dump SoC registers.")
-    parser.add_argument("--binary",  action="store_true",   help="Use binary format for displayed values.")
-    parser.add_argument("--filter",  default=None,          help="Registers filter (to be used with --regs).")
-    parser.add_argument("--read",    default=None,          help="Do a MMAP Read to SoC bus (--read addr/reg).")
-    parser.add_argument("--write",   default=None, nargs=2, help="Do a MMAP Write to SoC bus (--write addr/reg data).")
-    parser.add_argument("--length",  default="4",           help="MMAP access length.")
-    parser.add_argument("--gui",     action="store_true",   help="Run Gui.")
+    # Common.
+    parser.add_argument("--csr-csv",    default="csr.csv",       help="CSR configuration file")
+    parser.add_argument("--host",       default="localhost",     help="Host ip address")
+    parser.add_argument("--port",       default="1234",          help="Host bind port.")
+    parser.add_argument("--binary",     action="store_true",     help="Use binary format for displayed values.")
+    parser.add_argument("--file",       default=None,            help="File to read from or write to in binary mode.")
+    parser.add_argument("--endianness", default="little",        choices=["little", "big"], help="Endianness for memory accesses (little or big).")
+
+    # Identifier.
+    parser.add_argument("--ident",      action="store_true",     help="Dump SoC identifier.")
+
+    # Registers.
+    parser.add_argument("--regs",       action="store_true",     help="Dump SoC registers.")
+    parser.add_argument("--filter",     default=None,            help="Registers filter (to be used with --regs).")
+
+    # Memory.
+    parser.add_argument("--read",       default=None,            help="Do a MMAP Read to SoC bus (--read addr/reg).")
+    parser.add_argument("--write",      default=None, nargs="*", help="Do a MMAP Write to SoC bus (--write addr/reg [data]).")
+    parser.add_argument("--length",     default="4",             help="MMAP access length.")
+
+    # GUI.
+    parser.add_argument("--gui",        action="store_true",     help="Run GUI.")
+
     args = parser.parse_args()
 
+    # Parameters.
     host    = args.host
     csr_csv = args.csr_csv
     port    = int(args.port, 0)
 
+    # Identifier.
     if args.ident:
         dump_identifier(
             host    = host,
@@ -407,45 +669,63 @@ def main():
             port    = port,
         )
 
+    # Registers.
     if args.regs:
         dump_registers(
-            host    = args.host,
+            host    = host,
             csr_csv = csr_csv,
             port    = port,
             filter  = args.filter,
             binary  = args.binary,
         )
 
+    # Memory Read.
     if args.read:
         try:
            addr = int(args.read, 0)
         except ValueError:
             addr = reg2addr(host, csr_csv, args.read)
         read_memory(
-            host    = args.host,
-            csr_csv = csr_csv,
-            port    = port,
-            addr    = addr,
-            length  = int(args.length, 0),
-            binary  = args.binary,
+            host       = host,
+            csr_csv    = csr_csv,
+            port       = port,
+            addr       = addr,
+            length     = int(args.length, 0),
+            binary     = args.binary,
+            file       = args.file,
+            endianness = args.endianness,
         )
 
+    # Memory Write.
     if args.write:
         try:
-           addr = int(args.write[0], 0)
+            addr = int(args.write[0], 0)
         except ValueError:
             addr = reg2addr(host, csr_csv, args.write[0])
+
+        # If --file is provided, ignore the second argument for --write
+        if args.file:
+            data = 0  # Dummy value, not used when --file is provided
+        else:
+            if len(args.write) < 2:
+                raise ValueError("Data argument is required for --write when --file is not provided.")
+            data = int(args.write[1], 0)
+
         write_memory(
-            host    = args.host,
-            csr_csv = csr_csv,
-            port    = port,
-            addr    = addr,
-            data    = int(args.write[1], 0),
+            host       = host,
+            csr_csv    = csr_csv,
+            port       = port,
+            addr       = addr,
+            data       = data,
+            file       = args.file,
+            length     = int(args.length, 0) if args.length else None,
+            endianness = args.endianness,
         )
 
+    # GUI.
     if args.gui:
         run_gui(
-            host    = args.host,
+            host    = host,
             csr_csv = csr_csv,
             port    = port,
         )

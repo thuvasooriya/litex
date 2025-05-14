@@ -109,9 +109,11 @@ static void rx_callback(uint32_t src_ip, uint16_t src_port,
 		return;
 	}
 	if (opcode == TFTP_OACK) { /* Option Acknowledgement */
+		data_port = src_port;
 		packet_data = udp_get_tx_buffer();
 		length = format_ack(packet_data, 0);
 		udp_send(PORT_IN, src_port, length);
+		last_ack = 0;
 		return;
 	}
 	if(block < 1) return;
@@ -142,8 +144,10 @@ int tftp_get(uint32_t ip, uint16_t server_port, const char *filename,
 	int i;
 	int length_before;
 
-	if(!udp_arp_resolve(ip))
+	if(!udp_arp_resolve(ip)) {
+		printf("ARP failed\n");
 		return -1;
+	}
 
 	udp_set_callback((udp_callback) rx_callback);
 

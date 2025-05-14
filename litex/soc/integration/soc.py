@@ -13,24 +13,23 @@ import time
 import logging
 import argparse
 import datetime
-from math import log2, ceil
 
 from migen import *
 
-from litex.gen import colorer
-from litex.gen import LiteXModule, LiteXContext
-from litex.gen.genlib.misc import WaitTimer
+from litex.gen                import colorer
+from litex.gen                import LiteXModule, LiteXContext
+from litex.gen.genlib.misc    import WaitTimer
 from litex.gen.fhdl.hierarchy import LiteXHierarchyExplorer
 
 from litex.compat.soc_core import *
 
-from litex.soc.interconnect.csr import *
+from litex.soc.interconnect.csr              import *
 from litex.soc.interconnect.csr_eventmanager import *
-from litex.soc.interconnect import csr_bus
-from litex.soc.interconnect import stream
-from litex.soc.interconnect import wishbone
-from litex.soc.interconnect import axi
-from litex.soc.interconnect import ahb
+from litex.soc.interconnect                  import csr_bus
+from litex.soc.interconnect                  import stream
+from litex.soc.interconnect                  import wishbone
+from litex.soc.interconnect                  import axi
+from litex.soc.interconnect                  import ahb
 
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -93,8 +92,8 @@ class SoCRegion:
             raise SoCError()
         if (not self.decode) or ((origin == 0) and (size == 2**bus.address_width)):
             return lambda a: True
-        origin >>= int(log2(bus.data_width//8)) # bytes to words aligned.
-        size   >>= int(log2(bus.data_width//8)) # bytes to words aligned.
+        origin >>= int(math.log2(bus.data_width//8)) # bytes to words aligned.
+        size   >>= int(math.log2(bus.data_width//8)) # bytes to words aligned.
         return lambda a: (a[log2_int(size):] == (origin >> log2_int(size)))
 
     def __str__(self):
@@ -319,7 +318,7 @@ class SoCBusHandler(LiteXModule):
         is_in = True
         if not (region.origin >= container.origin):
             is_in = False
-        if not ((region.origin + region.size) < (container.origin + container.size)):
+        if not ((region.origin + region.size) <= (container.origin + container.size)):
             is_in = False
         return is_in
 
@@ -508,7 +507,7 @@ class SoCBusHandler(LiteXModule):
             colorer("added", color="green")))
 
     def add_controller(self, name=None, controller=None):
-        self.add_master(self, name=name, master=controller)
+        self.add_master(name=name, master=controller)
 
     def add_slave(self, name=None, slave=None, region=None):
         no_name   = name   is None
@@ -1139,13 +1138,14 @@ class SoC(LiteXModule, SoCCoreCompat):
         }[self.bus.standard]
         csr_bridge_name = f"{name}_bridge"
         self.check_if_exists(csr_bridge_name)
+        data_width = self.csr.data_width
         csr_bridge = csr_bridge_cls(
             bus_bridge_cls(
                 address_width = self.bus.address_width,
-                data_width    = self.bus.data_width),
+                data_width    = data_width),
             bus_csr = csr_bus.Interface(
                 address_width = self.csr.address_width,
-                data_width    = self.csr.data_width),
+                data_width    = data_width),
             register = register)
         self.logger.info("CSR Bridge {} {}.".format(
             colorer(name, color="underline"),
@@ -1512,7 +1512,7 @@ class LiteXSoC(SoC):
         self.add_config(name, identifier)
 
     # Add UART -------------------------------------------------------------------------------------
-    def add_uart(self, name="uart", uart_name="serial", uart_pads=None, baudrate=115200, fifo_depth=16):
+    def add_uart(self, name="uart", uart_name="serial", uart_pads=None, baudrate=115200, fifo_depth=16, with_dynamic_baudrate=False):
         # Imports.
         from litex.soc.cores.uart import UART, UARTCrossover
 
@@ -1551,7 +1551,7 @@ class LiteXSoC(SoC):
 
         # Crossover + UARTBone.
         elif uart_name in ["crossover+uartbone"]:
-            self.add_uartbone(baudrate=baudrate)
+            self.add_uartbone(baudrate=baudrate, with_dynamic_baudrate=with_dynamic_baudrate)
             uart = UARTCrossover(**uart_kwargs)
 
         # JTAG UART.
@@ -1589,7 +1589,7 @@ class LiteXSoC(SoC):
         # Regular UART.
         else:
             from litex.soc.cores.uart import UARTPHY
-            uart_phy  = UARTPHY(uart_pads, clk_freq=self.sys_clk_freq, baudrate=baudrate)
+            uart_phy  = UARTPHY(uart_pads, clk_freq=self.sys_clk_freq, baudrate=baudrate, with_dynamic_baudrate=with_dynamic_baudrate)
             uart      = UART(uart_phy, **uart_kwargs)
 
         # Add PHY/UART.
@@ -1605,7 +1605,7 @@ class LiteXSoC(SoC):
             self.add_constant("UART_POLLING", check_duplicate=False)
 
     # Add UARTbone ---------------------------------------------------------------------------------
-    def add_uartbone(self, name="uartbone", uart_name="serial", clk_freq=None, baudrate=115200, cd="sys"):
+    def add_uartbone(self, name="uartbone", uart_name="serial", clk_freq=None, baudrate=115200, cd="sys", with_dynamic_baudrate=False):
         # Imports.
         from litex.soc.cores import uart
 
@@ -1613,7 +1613,7 @@ class LiteXSoC(SoC):
         if clk_freq is None:
             clk_freq = self.sys_clk_freq
         self.check_if_exists(name)
-        uartbone_phy = uart.UARTPHY(self.platform.request(uart_name), clk_freq, baudrate)
+        uartbone_phy = uart.UARTPHY(self.platform.request(uart_name), clk_freq, baudrate, with_dynamic_baudrate=with_dynamic_baudrate)
         uartbone     = uart.UARTBone(
             phy           = uartbone_phy,
             clk_freq      = clk_freq,
@@ -1681,7 +1681,7 @@ class LiteXSoC(SoC):
         if hasattr(module, "_spd_data"):
             # Pack the data into words of bus width.
             bytes_per_word = self.bus.data_width // 8
-            mem = [0] * ceil(len(module._spd_data) / bytes_per_word)
+            mem = [0] * math.ceil(len(module._spd_data) / bytes_per_word)
             for i in range(len(mem)):
                 for offset in range(bytes_per_word):
                     mem[i] <<= 8
@@ -1733,7 +1733,7 @@ class LiteXSoC(SoC):
             for mem_bus in self.cpu.memory_buses:
                 # Request a LiteDRAM native port.
                 port = sdram.crossbar.get_port()
-                port.data_width = 2**int(log2(port.data_width)) # Round to nearest power of 2.
+                port.data_width = 2**int(math.log2(port.data_width)) # Round to nearest power of 2.
 
                 # Check if bus is an AXI bus and connect it.
                 if isinstance(mem_bus, axi.AXIInterface):
@@ -1804,7 +1804,7 @@ class LiteXSoC(SoC):
         if connect_main_bus_to_dram:
             # Request a LiteDRAM native port.
             port = sdram.crossbar.get_port()
-            port.data_width = 2**int(log2(port.data_width)) # Round to nearest power of 2.
+            port.data_width = 2**int(math.log2(port.data_width)) # Round to nearest power of 2.
 
             # Create Wishbone Slave.
             wb_sdram = wishbone.Interface(data_width=self.bus.data_width, address_width=32, addressing="word")
@@ -1814,7 +1814,7 @@ class LiteXSoC(SoC):
             if l2_cache_size != 0:
                 # Insert L2 cache inbetween Wishbone bus and LiteDRAM
                 l2_cache_size = max(l2_cache_size, int(2*port.data_width/8)) # Use minimal size if lower
-                l2_cache_size = 2**int(log2(l2_cache_size))                  # Round to nearest power of 2
+                l2_cache_size = 2**int(math.log2(l2_cache_size))                  # Round to nearest power of 2
                 l2_cache_data_width = max(port.data_width, l2_cache_min_data_width)
                 l2_cache = wishbone.Cache(
                     cachesize = l2_cache_size//4,
@@ -2049,6 +2049,18 @@ class LiteXSoC(SoC):
             add_ip_address_constants(self,  "REMOTEIP", ethmac_remote_ip)
             add_mac_address_constants(self, "MACADDR",  ethmac_address)
 
+    # Add I2C Master -------------------------------------------------------------------------------
+    def add_i2c_master(self, name="i2cmaster", pads=None, **kwargs):
+        # Imports.
+        from litei2c import LiteI2C
+
+        # Core.
+        self.check_if_exists(name)
+        if pads is None:
+            pads = self.platform.request(name)
+        i2c = LiteI2C(self.sys_clk_freq, pads=pads, **kwargs)
+        self.add_module(name=name, module=i2c)
+
     # Add SPI Master --------------------------------------------------------------------------------
     def add_spi_master(self, name="spimaster", pads=None, data_width=8, spi_clk_freq=1e6, with_clk_divider=True, **kwargs):
         # Imports.
@@ -2152,7 +2164,7 @@ class LiteXSoC(SoC):
         if l2_cache_size != 0:
             # Insert L2 cache inbetween Wishbone bus and LiteSPI
             l2_cache_size = max(l2_cache_size, int(2*32/8))              # Use minimal size if lower
-            l2_cache_size = 2**int(log2(l2_cache_size))                  # Round to nearest power of 2
+            l2_cache_size = 2**int(math.log2(l2_cache_size))                  # Round to nearest power of 2
             l2_cache = wishbone.Cache(
                 cachesize = l2_cache_size//4,
                 master    = wb_spiram,
@@ -2296,12 +2308,13 @@ class LiteXSoC(SoC):
             self.add_constant(f"{name}_DEBUG")
 
     # Add SATA -------------------------------------------------------------------------------------
-    def add_sata(self, name="sata", phy=None, mode="read+write", with_identify=True):
+    def add_sata(self, name="sata", phy=None, mode="read+write", with_identify=True, with_bist=False):
         # Imports.
-        from litesata.core import LiteSATACore
+        from litesata.core                 import LiteSATACore
         from litesata.frontend.arbitration import LiteSATACrossbar
-        from litesata.frontend.identify import LiteSATAIdentify, LiteSATAIdentifyCSR
-        from litesata.frontend.dma import LiteSATASector2MemDMA, LiteSATAMem2SectorDMA
+        from litesata.frontend.identify    import LiteSATAIdentify, LiteSATAIdentifyCSR
+        from litesata.frontend.bist        import LiteSATABIST
+        from litesata.frontend.dma         import LiteSATASector2MemDMA, LiteSATAMem2SectorDMA
 
         # Checks.
         assert mode in ["read", "write", "read+write"]
@@ -2322,6 +2335,11 @@ class LiteXSoC(SoC):
         self.check_if_exists(f"{name}_crossbar")
         sata_crossbar = LiteSATACrossbar(sata_core)
         self.add_module(name=f"{name}_crossbar", module=sata_crossbar)
+
+        # BIST.
+        if with_bist:
+            sata_bist =  LiteSATABIST(sata_crossbar, with_csr=True)
+            self.add_module(name=f"{name}_bist", module=sata_bist)
 
         # Identify.
         if with_identify:
@@ -2395,7 +2413,7 @@ class LiteXSoC(SoC):
         with_dma_loopback     = True,
         with_dma_synchronizer = False,
         with_dma_monitor      = False,
-        with_dma_status       = False,
+        with_dma_status       = False, status_width=32,
         with_dma_table        = True,
         with_msi              = True, msi_type="msi", msi_width=32, msis={},
         with_ptm              = False,
@@ -2450,7 +2468,7 @@ class LiteXSoC(SoC):
                 with_loopback     = with_dma_loopback,
                 with_synchronizer = with_dma_synchronizer,
                 with_monitor      = with_dma_monitor,
-                with_status       = with_dma_status,
+                with_status       = with_dma_status, status_width=status_width,
                 with_table        = with_dma_table,
                 address_width     = address_width,
                 data_width        = data_width,
